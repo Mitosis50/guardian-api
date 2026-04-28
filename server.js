@@ -71,7 +71,10 @@ app.post('/webhook/gumroad', async (req, res) => {
   res.json({ ok: true });
 
   try {
-    const { email, sale_id, seller_id } = req.body;
+    // URL-encoded forms send '+' as space — normalize email before use
+    const email = String(req.body.email || '').replace(/\s/g, '+').trim().toLowerCase();
+    const sale_id = req.body.sale_id;
+    const seller_id = req.body.seller_id;
     const permalink = extractPermalink(req.body);
 
     // Basic validation — log and bail silently (already responded 200)
