@@ -32,6 +32,21 @@ const PERMALINK_TO_TIER = {
   ugmpm:  'lifetime',
 };
 
+/**
+ * Extracts the permalink slug from the Gumroad webhook body.
+ * Gumroad may send "product_permalink" or "permalink", and the value
+ * may be just the slug ("ninnii") OR a full URL ("https://cellular84.gumroad.com/l/ninnii").
+ */
+function extractPermalink(body) {
+  const raw = String(body.product_permalink || body.permalink || '').trim().toLowerCase();
+  // Check if it is a full URL — extract the last path segment
+  if (raw.includes('/l/')) {
+    const slug = raw.split('/l/').pop().split('?')[0].split('/')[0];
+    return slug;
+  }
+  return raw;
+}
+
 function dbGuard(res, emptyPayload = null) {
   if (!supabase) {
     console.warn('⚠️  Supabase client is not initialised — returning empty data.');
@@ -50,34 +65,40 @@ app.get('/health', (_req, res) => {
 // ─── Gumroad Webhook ──────────────────────────────────────────────────────────
 // POST /webhook/gumroad
 // Gumroad sends an application/x-www-form-urlencoded POST on every sale.
-// Required fields: email, permalink (product permalink), sale_id.
+// IMPORTANT: Always respond 200 IMMEDIATELY — Gumroad retries on any other code or timeout.
 app.post('/webhook/gumroad', async (req, res) => {
-  try {
-    const { email, permalink, sale_id, seller_id } = req.body;
+  // Acknowledge immediately — never let Gumroad time out
+  res.json({ ok: true });
 
-    // Basic validation
+  try {
+    const { email, sale_id, seller_id } = req.body;
+    const permalink = extractPermalink(req.body);
+
+    // Basic validation — log and bail silently (already responded 200)
     if (!email || !permalink) {
-      return res.status(400).json({ ok: false, error: 'Missing required fields: email, permalink' });
+      console.warn('Gumroad webhook missing email or permalink. Body:', JSON.stringify(req.body));
+      return;
     }
 
     const tier = PERMALINK_TO_TIER[permalink];
     if (!tier) {
       console.warn(`Unknown Gumroad permalink received: "${permalink}"`);
-      // Still acknowledge so Gumroad doesn't retry forever
-      return res.json({ ok: true, warning: `Unknown permalink "${permalink}" — no tier mapped.` });
+      return;
     }
 
     console.log(`Gumroad sale: email=${email} permalink=${permalink} → tier=${tier} sale_id=${sale_id}`);
 
     // Short-circuit if no DB
-    const guarded = dbGuard(res, { email, tier });
-    if (guarded) return;
+    if (!supabase) {
+      console.warn('Supabase not configured — skipping DB write.');
+      return;
+    }
 
     // Upsert user record
     const { data: userData, error: userError } = await supabase
       .from('users')
       .upsert(
-        { email, tier, updated_at: new Date().toISOString() },
+        { email, tier, gumroad_sale_id: sale_id || null, updated_at: new Date().toISOString() },
         { onConflict: 'email' }
       )
       .select()
@@ -85,11 +106,11 @@ app.post('/webhook/gumroad', async (req, res) => {
 
     if (userError) {
       console.error('Supabase upsert error (users):', userError.message);
-      return res.status(500).json({ ok: false, error: userError.message });
+      return;
     }
 
-    // Log the sale for audit trail
-    await supabase.from('sales').insert({
+    // Log the sale (sales table — created by migration script)
+    const { error: saleError } = await supabase.from('sales').insert({
       email,
       permalink,
       tier,
@@ -98,10 +119,14 @@ app.post('/webhook/gumroad', async (req, res) => {
       created_at: new Date().toISOString(),
     });
 
-    return res.json({ ok: true, data: userData });
+    if (saleError) {
+      // Non-fatal: sales table may not exist yet — log but don't crash
+      console.warn('Could not insert into sales table (non-fatal):', saleError.message);
+    }
+
+    console.log(`✅ Tier activated: ${email} → ${tier}`);
   } catch (err) {
     console.error('Unexpected error in /webhook/gumroad:', err);
-    return res.status(500).json({ ok: false, error: 'Internal server error' });
   }
 });
 
@@ -173,7 +198,7 @@ app.post('/api/backup', async (req, res) => {
     email,
     cid,
     filename,
-    size: size !== undefined ? Number(size) : null,
+    size_bytes: size !== undefined ? Number(size) : null,  // ← FIX: was "size", schema uses "size_bytes"
     encrypted: encrypted === true || encrypted === 'true',
     deleted: false,
     created_at: new Date().toISOString(),
