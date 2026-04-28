@@ -1,0 +1,5 @@
+node_modules/
+.env
+*.log
+purchase-log.json
+tiers.json
