@@ -83,7 +83,8 @@ app.use((req, _res, next) => {
   requestCount += 1;
   runtimeMetrics.http.requests += 1;
   runtimeMetrics.http.last_request_at = new Date().toISOString();
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  const safePath = req.path.replace(/\/api\/(agents|tier)\/[^/]+/i, '/api/$1/:email');
+  console.log(`[${new Date().toISOString()}] ${req.method} ${safePath}`);
   next();
 });
 
@@ -228,6 +229,41 @@ function requireGumroadSecret(req, res, next) {
   return next();
 }
 
+async function requireSupabaseSession(req, res, next) {
+  if (!supabase) {
+    if (IS_PRODUCTION) return res.status(503).json({ ok: false, error: 'Authentication is not configured.' });
+    console.warn('⚠️  Supabase client is not initialised — allowing read route in non-production demo mode.');
+    req.guardianSession = { demo: true, email: normalizeEmail(req.params.email) };
+    return next();
+  }
+
+  const auth = req.get('authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  if (!token) return res.status(401).json({ ok: false, error: 'Missing Supabase session token.' });
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user?.email) {
+    return res.status(401).json({ ok: false, error: 'Invalid or expired Supabase session.' });
+  }
+
+  req.guardianSession = {
+    userId: data.user.id,
+    email: normalizeEmail(data.user.email),
+  };
+  return next();
+}
+
+function requireMatchingEmail(req, res, next) {
+  const requestedEmail = normalizeEmail(req.params.email);
+  if (!requestedEmail) return res.status(400).json({ ok: false, error: 'email is required' });
+  if (req.guardianSession?.demo) return next();
+  if (!req.guardianSession?.email) return res.status(401).json({ ok: false, error: 'Missing authenticated user.' });
+  if (requestedEmail !== req.guardianSession.email) {
+    return res.status(403).json({ ok: false, error: 'Authenticated user cannot access this email.' });
+  }
+  return next();
+}
+
 async function processGumroadWebhook(body) {
   runtimeMetrics.webhook.gumroad_received += 1;
   runtimeMetrics.webhook.last_received_at = new Date().toISOString();
@@ -354,7 +390,7 @@ app.post('/webhook/gumroad', requireGumroadSecret, (req, res) => {
 });
 
 // GET /api/agents/:email — list all non-deleted backups for a user
-app.get('/api/agents/:email', async (req, res) => {
+app.get('/api/agents/:email', requireSupabaseSession, requireMatchingEmail, async (req, res) => {
   const normalizedEmail = normalizeEmail(req.params.email);
   if (!normalizedEmail) return res.status(400).json({ ok: false, error: 'email is required' });
 
@@ -392,8 +428,46 @@ app.get('/api/agents/:email', async (req, res) => {
   return res.json({ ok: true, data: data || [] });
 });
 
+// GET /api/history/:email — list ALL backups for a user (including deleted) for the ledger view
+app.get('/api/history/:email', requireSupabaseSession, requireMatchingEmail, async (req, res) => {
+  const normalizedEmail = normalizeEmail(req.params.email);
+  if (!normalizedEmail) return res.status(400).json({ ok: false, error: 'email is required' });
+
+  const guarded = dbGuard(res, []);
+  if (guarded) return;
+
+  const { data: userData, error: userError } = await supabase
+    .from('users')
+    .select('id')
+    .eq('email', normalizedEmail)
+    .maybeSingle();
+
+  if (userError) {
+    recordDbRead(userError);
+    console.error('Supabase select error (users for history):', userError.message);
+    return res.status(500).json({ ok: false, error: userError.message });
+  }
+  recordDbRead(null);
+  if (!userData) return res.json({ ok: true, data: [] });
+
+  const { data, error } = await supabase
+    .from('uploads')
+    .select('*')
+    .eq('user_id', userData.id)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    recordDbRead(error);
+    console.error('Supabase select error (uploads for history):', error.message);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+  recordDbRead(null);
+
+  return res.json({ ok: true, data: data || [] });
+});
+
 // GET /api/tier/:email — return user tier
-app.get('/api/tier/:email', async (req, res) => {
+app.get('/api/tier/:email', requireSupabaseSession, requireMatchingEmail, async (req, res) => {
   const normalizedEmail = normalizeEmail(req.params.email);
   if (!normalizedEmail) return res.status(400).json({ ok: false, error: 'email is required' });
 
@@ -533,6 +607,7 @@ app.listen(PORT, () => {
   console.log('   GET  /api/validate-health');
   console.log('   POST /webhook/gumroad');
   console.log('   GET  /api/agents/:email');
+  console.log('   GET  /api/history/:email');
   console.log('   GET  /api/tier/:email');
   console.log('   POST /api/backup');
   console.log('   DEL  /api/backup/:cid');

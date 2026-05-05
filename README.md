@@ -149,7 +149,9 @@ create index if not exists uploads_cid_idx   on uploads (cid);
 2. Create a new Railway project → **Deploy from GitHub repo**.
 3. In the Railway project dashboard, go to **Variables** and set:
    - `SUPABASE_URL`
-   - `SUPABASE_ANON_KEY`
+   - `SUPABASE_SERVICE_ROLE_KEY` *(preferred for trusted server reads/writes and session validation)*
+   - `SUPABASE_ANON_KEY` *(fallback only; RLS may block server writes)*
+   - `ALLOWED_ORIGINS=https://agentbotguardian.com,https://www.agentbotguardian.com`
    - `GUMROAD_SECRET` *(optional — for future HMAC verification)*
    - `PORT` is set automatically by Railway.
 4. Railway detects `railway.json` and uses NIXPACKS to build + `node server.js` to start.
@@ -161,10 +163,13 @@ create index if not exists uploads_cid_idx   on uploads (cid);
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `SUPABASE_URL` | Yes (for DB) | Your Supabase project URL |
-| `SUPABASE_ANON_KEY` | Yes (for DB) | Supabase anon/public API key |
+| `SUPABASE_URL` | Yes (for DB/auth) | Your Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | Recommended | Trusted server key for reads/writes and Supabase JWT validation |
+| `SUPABASE_ANON_KEY` | Fallback | Public anon key; useful for auth validation but may be blocked by RLS for DB writes |
+| `ALLOWED_ORIGINS` / `CORS_ORIGIN` | Yes in production | Comma-separated allowed dashboard origins |
+| `CLIENT_AUTH` | Yes in production for writes | Bearer token for desktop app write/heartbeat routes |
+| `GUMROAD_SECRET` | Recommended | Shared secret for Gumroad webhook requests |
 | `PORT` | No | HTTP port (default: 3001) |
-| `GUMROAD_SECRET` | Recommended | For future webhook HMAC signature validation |
 
 ---
 
