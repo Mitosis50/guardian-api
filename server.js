@@ -111,6 +111,17 @@ const PERMALINK_TO_TIER = {
   ugmpm: 'lifetime',
 };
 
+const TIER_LIMITS = {
+  free: { maxBackups: 3, minIntervalHours: 24, arweave: false, bulkRestore: false },
+  guardian: { maxBackups: 10, minIntervalHours: 6, arweave: true, bulkRestore: true },
+  pro: { maxBackups: Infinity, minIntervalHours: 1, arweave: true, bulkRestore: true },
+  lifetime: { maxBackups: Infinity, minIntervalHours: 1, arweave: true, bulkRestore: true },
+};
+
+function getTierLimits(tier) {
+  return TIER_LIMITS[tier] || TIER_LIMITS.free;
+}
+
 function extractPermalink(body) {
   const raw = String(body.product_permalink || body.permalink || '').trim().toLowerCase();
   if (raw.includes('/l/')) return raw.split('/l/').pop().split('?')[0].split('/')[0];
@@ -490,6 +501,176 @@ app.get('/api/tier/:email', requireSupabaseSession, requireMatchingEmail, async 
   return res.json({ ok: true, data });
 });
 
+// POST /api/activate — verify Gumroad license key and upgrade tier
+app.post('/api/activate', requireSupabaseSession, async (req, res) => {
+  const email = normalizeEmail(req.body.email || req.guardianSession?.email);
+  const licenseKey = normalizeText(req.body.license_key, 128);
+
+  if (!email) return res.status(400).json({ ok: false, error: 'email is required' });
+  if (!licenseKey) return res.status(400).json({ ok: false, error: 'license_key is required' });
+
+  if (req.guardianSession?.email && email !== req.guardianSession.email) {
+    return res.status(403).json({ ok: false, error: 'Authenticated user cannot activate for a different email.' });
+  }
+
+  const guarded = dbGuard(res, { tier: null });
+  if (guarded) return;
+
+  // Verify license against Gumroad
+  let verifiedTier = null;
+  let gumroadPurchase = null;
+
+  for (const [permalink, tier] of Object.entries(PERMALINK_TO_TIER)) {
+    try {
+      const gumroadRes = await fetch('https://api.gumroad.com/v2/licenses/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ product_permalink: permalink, license_key: licenseKey }),
+      });
+      const gumroadData = await gumroadRes.json();
+      if (gumroadData?.success) {
+        verifiedTier = tier;
+        gumroadPurchase = gumroadData.purchase;
+        break;
+      }
+    } catch (err) {
+      console.warn(`Gumroad verify failed for permalink ${permalink}:`, err.message);
+    }
+  }
+
+  if (!verifiedTier) {
+    return res.status(400).json({ ok: false, error: 'Invalid or expired license key.' });
+  }
+
+  // Update user tier in Supabase
+  const { error: upsertError } = await supabase
+    .from('users')
+    .upsert(
+      { email, tier: verifiedTier, updated_at: new Date().toISOString() },
+      { onConflict: 'email' }
+    );
+
+  if (upsertError) {
+    recordDbWrite(upsertError);
+    console.error('Supabase upsert error (activate):', upsertError.message);
+    return res.status(500).json({ ok: false, error: 'Failed to activate tier. Please try again.' });
+  }
+  recordDbWrite(null);
+
+  console.log(`✅ License activated: ${email} → ${verifiedTier}`);
+  return res.json({
+    ok: true,
+    data: {
+      email,
+      tier: verifiedTier,
+      product_name: gumroadPurchase?.product_name || null,
+      activated_at: new Date().toISOString(),
+    },
+  });
+});
+
+// POST /api/heartbeat — desktop app sends periodic health status
+// Requires Supabase session + matching email (same as /api/agents/:email)
+// Body: { email, agentCount, lastBackupAt, tier, appVersion, state }
+app.post('/api/heartbeat', requireSupabaseSession, async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const { agentCount, lastBackupAt, tier, appVersion, state } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ ok: false, error: 'email is required' });
+  }
+
+  // Validate email matches session
+  const sessionEmail = req.user?.email;
+  if (sessionEmail && sessionEmail.toLowerCase() !== email.toLowerCase()) {
+    return res.status(403).json({ ok: false, error: 'Email mismatch with session' });
+  }
+
+  try {
+    // Upsert heartbeat into heartbeats table
+    const { data: heartbeatData, error: heartbeatError } = await supabase
+      .from('heartbeats')
+      .upsert(
+        {
+          email: email.toLowerCase(),
+          agent_count: Number(agentCount) || 0,
+          last_backup_at: lastBackupAt || null,
+          tier: tier || 'free',
+          app_version: appVersion || null,
+          state: state || 'idle',
+          last_seen_at: new Date().toISOString(),
+        },
+        { onConflict: 'email' }
+      )
+      .select();
+
+    if (heartbeatError) {
+      recordDbWrite(heartbeatError);
+      console.error('Supabase upsert error (heartbeat):', heartbeatError.message);
+      return res.status(500).json({ ok: false, error: 'Failed to record heartbeat' });
+    }
+    recordDbWrite(null);
+
+    runtimeMetrics.cron.heartbeats += 1;
+    runtimeMetrics.cron.last_heartbeat_at = new Date().toISOString();
+
+    res.json({
+      ok: true,
+      data: {
+        email,
+        received_at: new Date().toISOString(),
+        agent_count: agentCount || 0,
+      },
+    });
+  } catch (err) {
+    recordDbWrite(err);
+    console.error('Heartbeat endpoint error:', err.message || err);
+    res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+});
+
+// GET /api/heartbeat/:email — fetch last heartbeat status for a user
+// Requires Supabase session + matching email (same as /api/agents/:email)
+app.get('/api/heartbeat/:email', requireSupabaseSession, requireMatchingEmail, async (req, res) => {
+  const normalizedEmail = normalizeEmail(req.params.email);
+  if (!normalizedEmail) return res.status(400).json({ ok: false, error: 'email is required' });
+
+  const guarded = dbGuard(res, {});
+  if (guarded) return;
+
+  try {
+    const { data: heartbeatData, error: heartbeatError } = await supabase
+      .from('heartbeats')
+      .select('*')
+      .eq('email', normalizedEmail)
+      .single();
+
+    if (heartbeatError && heartbeatError.code !== 'PGRST116') {
+      recordDbRead(heartbeatError);
+      console.error('Supabase read error (heartbeat):', heartbeatError.message);
+      return res.status(500).json({ ok: false, error: 'Failed to fetch heartbeat' });
+    }
+    recordDbRead(null);
+
+    // No heartbeat found is OK — app may not have sent one yet
+    const heartbeat = heartbeatData || {
+      email: normalizedEmail,
+      agent_count: 0,
+      state: 'offline',
+      last_seen_at: null,
+    };
+
+    res.json({
+      ok: true,
+      data: heartbeat,
+    });
+  } catch (err) {
+    recordDbRead(err);
+    console.error('Heartbeat fetch error:', err.message || err);
+    res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+});
+
 // POST /api/backup — insert a new backup record
 app.post('/api/backup', requireApiToken, async (req, res) => {
   const email = normalizeEmail(req.body.email);
@@ -599,18 +780,21 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ ok: false, error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`🛡️  Agent Guardian API running on port ${PORT}`);
-  console.log('   GET  /health');
-  console.log('   GET  /api/metrics');
-  console.log('   POST /api/cron/heartbeat');
-  console.log('   GET  /api/validate-health');
-  console.log('   POST /webhook/gumroad');
-  console.log('   GET  /api/agents/:email');
-  console.log('   GET  /api/history/:email');
-  console.log('   GET  /api/tier/:email');
-  console.log('   POST /api/backup');
-  console.log('   DEL  /api/backup/:cid');
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`🛡️  Agent Guardian API running on port ${PORT}`);
+    console.log('   GET  /health');
+    console.log('   GET  /api/metrics');
+    console.log('   POST /api/cron/heartbeat');
+    console.log('   GET  /api/validate-health');
+    console.log('   POST /webhook/gumroad');
+    console.log('   GET  /api/agents/:email');
+    console.log('   GET  /api/history/:email');
+    console.log('   GET  /api/tier/:email');
+    console.log('   POST /api/activate');
+    console.log('   POST /api/backup');
+    console.log('   DEL  /api/backup/:cid');
+  });
+}
 
 module.exports = app;

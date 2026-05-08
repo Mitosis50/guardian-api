@@ -3,3 +3,17 @@ node_modules/
 *.log
 purchase-log.json
 tiers.json
+
+# Hero8 Agent Guardian safety ignores
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.p8
+*.mobileprovision
+.DS_Store
+._*
+build/
+coverage/
+.cache/
