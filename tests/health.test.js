@@ -38,7 +38,9 @@ describe('GET /health', () => {
 
 describe('GET /api/metrics', () => {
   it('returns 200 with runtime metrics and incidents', async () => {
-    const res = await request(app).get('/api/metrics')
+    const res = await request(app)
+      .get('/api/metrics')
+      .set('Authorization', 'Bearer test-client-token')
     expect(res.statusCode).toBe(200)
     expect(res.body).toHaveProperty('ok')
     expect(res.body).toHaveProperty('status')
@@ -52,7 +54,9 @@ describe('GET /api/metrics', () => {
 
 describe('GET /api/validate-health', () => {
   it('returns 200 with check list and incident summary', async () => {
-    const res = await request(app).get('/api/validate-health')
+    const res = await request(app)
+      .get('/api/validate-health')
+      .set('Authorization', 'Bearer test-client-token')
     expect(res.statusCode).toBe(200)
     expect(res.body).toHaveProperty('ok')
     expect(res.body).toHaveProperty('status')

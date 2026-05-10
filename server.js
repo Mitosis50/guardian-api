@@ -3,6 +3,8 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const supabase = require('./db');
 
 const app = express();
@@ -59,20 +61,53 @@ const CRON_HEARTBEAT_GRACE_MINUTES = Number(process.env.CRON_HEARTBEAT_GRACE_MIN
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
 app.disable('x-powered-by');
+app.use(helmet());
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Cache-Control', 'no-store');
   next();
 });
+
+// Rate limiters
+const standardLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ ok: false, error: 'Too many requests. Please try again later.' });
+  }
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ ok: false, error: 'Too many requests. Please try again later.' });
+  }
+});
+
+// Apply standard rate limiting globally
+app.use(standardLimiter);
+// Apply strict rate limiting to sensitive endpoints
+app.use('/webhook/gumroad', strictLimiter);
+app.use('/api/activate', strictLimiter);
+app.use('/api/backup', strictLimiter);
 app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.length === 0) {
-      return callback(IS_PRODUCTION ? new Error('CORS origins are not configured') : null, !IS_PRODUCTION);
+      if (IS_PRODUCTION) {
+        console.warn('CORS origins are not configured in production; blocking cross-origin requests.');
+        return callback(null, false);
+      }
+      return callback(null, true);
     }
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    return callback(new Error('CORS origin not allowed'));
+    return callback(null, false);
   }
 }));
 app.use(express.json());
@@ -245,9 +280,23 @@ function requireGumroadSecret(req, res, next) {
     console.warn('⚠️  Webhook auth is not set; accepting webhook in non-production mode.');
     return next();
   }
+  // Check legacy shared secret (header/query/body) for backward compatibility
   const provided = req.query.secret || req.get('x-guardian-webhook-secret') || req.body.secret;
-  if (provided !== WEBHOOK_AUTH) return res.status(401).json({ ok: false, error: 'Unauthorized webhook' });
-  return next();
+  if (provided === WEBHOOK_AUTH) return next();
+
+  // Verify Gumroad HMAC signature if present
+  const signature = req.get('x-gumroad-signature');
+  if (signature) {
+    const crypto = require('crypto');
+    const expected = crypto.createHmac('sha256', WEBHOOK_AUTH)
+      .update(JSON.stringify(req.body))
+      .digest('hex');
+    if (crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+      return next();
+    }
+  }
+
+  return res.status(401).json({ ok: false, error: 'Unauthorized webhook' });
 }
 
 async function requireSupabaseSession(req, res, next) {
@@ -358,7 +407,7 @@ app.get('/health', (_req, res) => {
   res.json(buildHealthSnapshot());
 });
 
-app.get('/api/metrics', (_req, res) => {
+app.get('/api/metrics', requireApiToken, (_req, res) => {
   const health = buildHealthSnapshot();
   const incidents = buildIncidents(health);
   res.json({
@@ -378,7 +427,7 @@ app.post('/api/cron/heartbeat', requireApiToken, (req, res) => {
   res.json({ ok: true, data: runtimeMetrics.cron });
 });
 
-app.get('/api/validate-health', (_req, res) => {
+app.get('/api/validate-health', requireApiToken, (_req, res) => {
   const health = buildHealthSnapshot();
   const incidents = buildIncidents(health);
   const checks = [
@@ -591,7 +640,7 @@ app.post('/api/heartbeat', requireSupabaseSession, async (req, res) => {
   }
 
   // Validate email matches session
-  const sessionEmail = req.user?.email;
+  const sessionEmail = req.guardianSession?.email;
   if (sessionEmail && sessionEmail.toLowerCase() !== email.toLowerCase()) {
     return res.status(403).json({ ok: false, error: 'Email mismatch with session' });
   }
@@ -995,6 +1044,7 @@ app.patch('/api/schedules/:id', requireSupabaseSession, async (req, res) => {
     .from('schedules')
     .update({ frequency, enabled, updated_at: new Date().toISOString() })
     .eq('id', id)
+    .eq('email', req.guardianSession.email)
     .select()
     .single();
 
@@ -1016,7 +1066,8 @@ app.delete('/api/schedules/:id', requireSupabaseSession, async (req, res) => {
   const { error } = await supabase
     .from('schedules')
     .delete()
-    .eq('id', id);
+    .eq('id', id)
+    .eq('email', req.guardianSession.email);
 
   if (error) {
     return res.status(500).json({ ok: false, error: error.message });
@@ -1290,7 +1341,8 @@ app.delete('/api/webhooks/subscriptions/:id', requireSupabaseSession, async (req
   const { error } = await supabase
     .from('webhook_subscriptions')
     .delete()
-    .eq('id', id);
+    .eq('id', id)
+    .eq('email', req.guardianSession.email);
 
   if (error) {
     return res.status(500).json({ ok: false, error: error.message });
@@ -1310,18 +1362,7 @@ app.use((err, _req, res, _next) => {
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`🛡️  Agent Guardian API running on port ${PORT}`);
-    console.log('   GET  /health');
-    console.log('   GET  /api/metrics');
-    console.log('   POST /api/cron/heartbeat');
-    console.log('   GET  /api/validate-health');
-    console.log('   POST /webhook/gumroad');
-    console.log('   GET  /api/agents/:email');
-    console.log('   GET  /api/history/:email');
-    console.log('   GET  /api/tier/:email');
-    console.log('   POST /api/activate');
-    console.log('   POST /api/backup');
-    console.log('   DEL  /api/backup/:cid');
+    console.log(`🛡️  Agent Guardian API running on port ${PORT} (${IS_PRODUCTION ? 'production' : 'dev'})`);
   });
 }
 
